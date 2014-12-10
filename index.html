@@ -1,1 +1,395 @@
-Hello World
+<!DOCTYPE html>
+<html>
+
+  <head>
+    <meta charset='utf-8'>
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <meta name="description" content="Heat VM HAのバグ修正 : ">
+
+    <link rel="stylesheet" type="text/css" media="screen" href="stylesheets/stylesheet.css">
+
+    <title>Heat VM HAのバグ修正</title>
+  </head>
+
+  <body>
+
+    <!-- HEADER -->
+    <div id="header_wrap" class="outer">
+        <header class="inner">
+          <a id="forkme_banner" href="https://github.com/sagara177">View on GitHub</a>
+
+          <h1 id="project_title">Heat VM HAのバグ修正</h1>
+          <h2 id="project_tagline"></h2>
+
+        </header>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div id="main_content_wrap" class="outer">
+      <section id="main_content" class="inner">
+        <h3>
+<a id="はじめに" class="anchor" href="#%E3%81%AF%E3%81%98%E3%82%81%E3%81%AB" aria-hidden="true"><span class="octicon octicon-link"></span></a>はじめに</h3>
+
+<p>Advent Calendarに勢いで飛びついてしまって「何か役立ちそうなことを書こう」と案を練っているうちに12/11を迎えてしまいました。
+結局そんな特別なものは用意できませんでした。すいません。。。
+「Heat関係」と予告しておいたので、Heatで今年個人的に一番面白かった作業を書こうと思います。</p>
+
+<p>Heatの機能でVM HAという機能があります。
+ざっくり説明すると、サービスやVMが異常状態の場合にVMを削除して起動し直してくれる機能です。</p>
+
+<p>この機能、Icehouseのリリース当初は、とあるバグが影響して動かなかったのではと思います。
+（もしくはリリース当初は動いていたけれど、以降のバージョンアップでデグレしてしまったとか。
+周辺コードをgit blame/git logしても、そういう形跡は見あたらなかったのですが。。）
+以下VM HAの詳細と、上記のバグを修正してパッチをコミットした話です。</p>
+
+<h3>
+<a id="heatのvm-ha機能について" class="anchor" href="#heat%E3%81%AEvm-ha%E6%A9%9F%E8%83%BD%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6" aria-hidden="true"><span class="octicon octicon-link"></span></a>HeatのVM HA機能について</h3>
+
+<p>まずはVM HAについてもう少し詳細を説明します。
+公式Wikiの<a href="https://wiki.openstack.org/wiki/Heat/Using-HA">Heat/Using-HA</a>を見ると’Create the HA example stack’に2つ例が紹介されています。</p>
+
+<ul>
+<li>HA（サービス監視）
+
+<ul>
+<li>VM内でサービス監視を行い異常の場合、通知を送る（異常通知）
+
+<ul>
+<li>/etc/cfn/hooks.confでサービス再起動時にnotify-on-httpd-restartedを実行</li>
+<li>notify-on-httpd-restartedで、cfn-push-stats --service-failureを実行</li>
+</ul>
+</li>
+<li>監視結果について、異常通知が一定期間に一定回数以上行われることがあるかチェック
+
+<ul>
+<li>AWS::CloudWatch::Alarm</li>
+</ul>
+</li>
+<li>上記の場合VMを削除して新規に作成しなおす
+
+<ul>
+<li>OS::Heat::HARestarter</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>IHA（VM監視）
+
+<ul>
+<li>VM内から生存通知を送る（正常通知）
+
+<ul>
+<li>cfn-hup-crontabで、cfn-push-stats --heartbeatを毎分実行</li>
+</ul>
+</li>
+<li>監視結果について、正常通知が一定期間に一定回数未満とならないかチェック
+
+<ul>
+<li>AWS::CloudWatch::Alarm</li>
+</ul>
+</li>
+<li>上記の場合VMを削除して新規に作成しなおす
+
+<ul>
+<li>OS::Heat::HARestarter</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+<p>上記の部分でVMから正常／異常通知を行う部分が今回のバグを修正した箇所です。</p>
+
+<h3>
+<a id="vm-ha機能を動かしてみる" class="anchor" href="#vm-ha%E6%A9%9F%E8%83%BD%E3%82%92%E5%8B%95%E3%81%8B%E3%81%97%E3%81%A6%E3%81%BF%E3%82%8B" aria-hidden="true"><span class="octicon octicon-link"></span></a>VM HA機能を動かしてみる</h3>
+
+<p>さて、上記Wikiのテンプレートを動かしてみます。
+（イメージによってインスタンス内のスクリプトとかサービス起動方法とか微修正が必要です。）
+HAとIHAどちらでも同様の症状が発生すると思いますが、自分はIHAの方で確認していました。
+heat stack-createでテンプレートを起動すると仮想リソースが続々作成され、動いた！と思うのですが、数分後に管理画面を見ると、どうもVMのUUIDが変わっています。
+VMが定期的に削除されていることに気がつきます orz...</p>
+
+<h3>
+<a id="問題解析---vm" class="anchor" href="#%E5%95%8F%E9%A1%8C%E8%A7%A3%E6%9E%90---vm" aria-hidden="true"><span class="octicon octicon-link"></span></a>問題解析 - VM</h3>
+
+<p>削除される前のVMに乗り込みます。</p>
+
+<p>/var/log/messagesなどに特にVMの起動関係の異常は見当たりません。
+使用しているイメージの異常で起動が失敗しているわけではなさそうです。
+VM内からHeatに通知を送るheat-cfntools周りのログを調べると、/var/log/cfn-push-statsに403エラーが出力されていることに気づきます。</p>
+
+<pre><code>DEBUG [2014-12-10 23:09:02,410] cfn-push-stats called Namespace(cpu_util=False, credential_file='/etc/cfn/cfn-credentials', disk_path='/', disk_space_avail=False, disk_space_used=False, disk_space_util=False, disk_units='megabytes', haproxy=False, haproxy_latency=False, heartbeat=True, mem_avail=False, mem_used=False, mem_util=False, memory_units='megabytes', metric=None, service_failure=False, swap_used=False, swap_util=False, units=None, value=None, verbose=False, watch='test-HeartbeatFailureAlarm') 
+DEBUG [2014-12-10 23:09:02,413] Using access key provided by client.
+DEBUG [2014-12-10 23:09:02,413] Using secret key provided by client.
+INFO [2014-12-10 23:09:02,414] Sending metric Heartbeat, Units Counter, Value 1
+DEBUG [2014-12-10 23:09:02,415] Method: POST
+DEBUG [2014-12-10 23:09:02,415] Path: /v1/
+DEBUG [2014-12-10 23:09:02,415] Data: 
+DEBUG [2014-12-10 23:09:02,415] Headers: {}
+DEBUG [2014-12-10 23:09:02,416] Host: 192.168.190.4
+DEBUG [2014-12-10 23:09:02,417] Port: 8003
+DEBUG [2014-12-10 23:09:02,417] Params: {'MetricData.member.1.Dimensions.member.2.Value': 'test-HeartbeatFailureAlarm', 'MetricData.member.1.Dimensions.member.2.Name': 'AlarmName', 'Namespace': 'system/linux', 'MetricData.member.1.Unit': 'Counter', 'MetricData.member.1.Value': 1, 'Action': 'PutMetricData', 'MetricData.member.1.Dimensions.member.1.Name': 'InstanceId', 'Version': '2010-08-01', 'MetricData.member.1.Dimensions.member.1.Value': u'614680ad-1052-4c4c-9d28-970f59fa2205', 'MetricData.member.1.MetricName': 'Heartbeat'}
+DEBUG [2014-12-10 23:09:02,417] establishing HTTP connection: kwargs={'port': 8003, 'timeout': 70}
+DEBUG [2014-12-10 23:09:02,417] Token: None
+DEBUG [2014-12-10 23:09:02,418] CanonicalRequest:
+POST
+/v1/
+
+host:192.168.190.4:8003
+x-amz-date:20141210T140902Z
+
+host;x-amz-date
+09f60093d26fc1ad29338da6af21ad82e7118b2d53919aaf674203df74c0fc8f
+DEBUG [2014-12-10 23:09:02,419] StringToSign:
+AWS4-HMAC-SHA256
+20141210T140902Z
+20141210/168/192/aws4_request
+52a207ed2f1a65fbab6b80a2e7c32793299c2e2b9e64e4e03587523e9ba0d4d9
+DEBUG [2014-12-10 23:09:02,419] Signature:
+f34c5f50ab202a149964ed8649f39b3df33c4eeb2174b590844b2cdd3defac33
+DEBUG [2014-12-10 23:09:02,457] &lt;ErrorResponse&gt;&lt;Error&gt;&lt;Message&gt;User is not authorized to perform action&lt;/Message&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Type&gt;Sender&lt;/Type&gt;&lt;/Error&gt;&lt;/ErrorResponse&gt;
+ERROR [2014-12-10 23:09:02,457] 403 AccessDenied
+ERROR [2014-12-10 23:09:02,458] &lt;ErrorResponse&gt;&lt;Error&gt;&lt;Message&gt;User is not authorized to perform action&lt;/Message&gt;&lt;Code&gt;AccessDenied&lt;/Code&gt;&lt;Type&gt;Sender&lt;/Type&gt;&lt;/Error&gt;&lt;/ErrorResponse&gt;
+</code></pre>
+
+<p>？？？。403なので対向のサーバにはリクエストが届いていそうです。
+同じテンプレート内に記述があり、同じくVMから通信するcfn-signalは問題なく動いています。
+とりあえずcfn-*の送信内容をtcpdumpで回収して、対向側を調べます。</p>
+
+<h3>
+<a id="問題解析---対向サーバheat" class="anchor" href="#%E5%95%8F%E9%A1%8C%E8%A7%A3%E6%9E%90---%E5%AF%BE%E5%90%91%E3%82%B5%E3%83%BC%E3%83%90heat" aria-hidden="true"><span class="octicon octicon-link"></span></a>問題解析 - 対向サーバ（Heat）</h3>
+
+<p>先ほどのcfn-push-statsの対向側は8003番ポートを使っているheat-api-cloudwatchのサービスです。
+デバッグを行います。自分はサービス起動を停止し、普通のプロセスとして’環境変数 python -m pdb <em>.py’経由で起動することで特定の位置にブレークポイントを設定して問題を追っていきます。（Horizonとかだとimport pdb; pdb.set_trace()です。もっと効率的なやり方もあるかも。）
+上記の起動時の環境変数や</em>.pyの部分は、bash -x service openstack-heat-api-cloudwatch startというふうに、スクリプト起動時の変数など含めて調べます。（2段階実施して調べます。）
+毎回Heatでスタックを作成すると大変なので、今回は先ほど回収したtcpdumpの内容をもとに、curlでHTTPのダミーリクエストを飛ばせるようにしました。</p>
+
+<p>heat-api-cloudwatchを見ていくと、keystone-clientのライブラリを使ってEC2リクエストについて改変されていないか確認しています。
+その際、シグネチャー確認をしている箇所で不一致になっていて403を返していることがわかります。
+POSTの際のクエリパラメータを、URLのパスにも含めシグネチャー計算するか否か、シグネチャー計算するクライアント側とサーバ側でロジックが一致していないようです。</p>
+
+<h3>
+<a id="問題解析---シグネチャー計算ロジックの比較" class="anchor" href="#%E5%95%8F%E9%A1%8C%E8%A7%A3%E6%9E%90---%E3%82%B7%E3%82%B0%E3%83%8D%E3%83%81%E3%83%A3%E3%83%BC%E8%A8%88%E7%AE%97%E3%83%AD%E3%82%B8%E3%83%83%E3%82%AF%E3%81%AE%E6%AF%94%E8%BC%83" aria-hidden="true"><span class="octicon octicon-link"></span></a>問題解析 - シグネチャー計算ロジックの比較</h3>
+
+<p>heat-cfntools側のシグネチャー計算は、botoのライブラリの中で行っているようです。</p>
+
+<p>boto/boto/auth.py</p>
+
+<pre><code>class HmacAuthV4Handler(AuthHandler, HmacKeys):
+
+    def canonical_query_string(self, http_request):
+        # POST requests pass parameters in through the
+        # http_request.body field.
+        if http_request.method == 'POST':
+            return ""
+        l = []
+        for param in sorted(http_request.params):
+            value = boto.utils.get_utf8_value(http_request.params[param])
+            l.append('%s=%s' % (urllib.parse.quote(param, safe='-_.~'),
+                                urllib.parse.quote(value, safe='-_.~')))
+        return '&amp;'.join(l)
+</code></pre>
+
+<p>HeatはAWS CloudFormationをもとに作られていて一部互換性もあるので、AWS製のheat-cfntools（aws-cfn-bootstrap）にも同様のロジックがあるはずです。
+aws-cfn-bootstrapは<a href="https://aws.amazon.com/developertools/AWS-CloudFormation/4026240853893296">Bootstrapping Applications using AWS CloudFormation</a>からダウンロードできます。ライセンスもApacheなので参考にしても問題なさそうです。確認してみます。</p>
+
+<p>cfnbootstrap/aws_client.py</p>
+
+<pre><code>class V4Signer(Signer):
+
+    def sign(self, verb, base_url, params, creds, in_headers=None, timestamp=None):
+
+        (canonical_headers, signed_headers) = self._canonicalize_headers(new_headers)
+        canonical_request += canonical_headers + '\n' + signed_headers + '\n'
+        canonical_request += hashlib.sha256(Client.construct_query(params).encode('utf-8') if verb == 'POST' else '').hexdigest()
+</code></pre>
+
+<p>やっぱりこっちもPOSTの場合はクエリパラメータをシグネチャー計算に含めていないです。</p>
+
+<p>一方、サーバー側は下のファイルです。</p>
+
+<p>keystoneclient/contrib/ec2/utils.py</p>
+
+<pre><code>class Ec2Signer(object):
+
+    def _calc_signature_4(self, params, verb, server_string, path,
+                          headers,
+                          body_hash):
+        """Generate AWS signature version 4 string."""
+
+        # Create canonical request:
+        # http://docs.aws.amazon.com/general/latest/gr/
+        # sigv4-create-canonical-request.html
+        # Get parameters and headers in expected string format
+        cr = "\n".join((verb.upper(), path,
+                        self._canonical_qs(params),
+                        canonical_header_str(),
+                        auth_param('SignedHeaders'),
+                        body_hash))
+
+    @staticmethod
+    def _canonical_qs(params):
+        """Construct a sorted, correctly encoded query string as required for                                                                         
+        _calc_signature_2 and _calc_signature_4.                                                                                                      
+        """
+        keys = list(params)
+        keys.sort()
+        pairs = []
+        for key in keys:
+            val = Ec2Signer._get_utf8_value(params[key])
+            val = urllib.parse.quote(val, safe='-_~')
+            pairs.append(urllib.parse.quote(key, safe='') + '=' + val)
+        qs = '&amp;'.join(pairs)
+        return qs
+</code></pre>
+
+<p>こちらはPOSTの場合に特にクエリパラメータをシグネチャー計算から除外していません。（クエリパラメータをシグネチャー計算に含めています。）</p>
+
+<h3>
+<a id="awsの仕様調査" class="anchor" href="#aws%E3%81%AE%E4%BB%95%E6%A7%98%E8%AA%BF%E6%9F%BB" aria-hidden="true"><span class="octicon octicon-link"></span></a>AWSの仕様調査</h3>
+
+<p>AWSの仕様を確認してみます。
+<a href="http://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html">Signing AWS Requests By Using Signature Version 4</a>に仕様が書かれていますが、どうもPOSTの処理について不明瞭な箇所があります。（すいません。記事執筆段階で時間がなく上記ページのどこが具体的に問題だったか再確認できませんでした。）</p>
+
+<p>まとめると</p>
+
+<ul>
+<li>シグネチャー計算のロジックについて実装が一致していない</li>
+<li>aws-cfn-bootstrap、および（heat-cfntoolsが使う）botoの場合
+
+<ul>
+<li>POSTの場合、クエリパラメータをシグネチャー計算に含めない</li>
+</ul>
+</li>
+<li>keystone-clientの場合
+
+<ul>
+<li>POSTの場合、クエリパラメータをシグネチャー計算に含める</li>
+</ul>
+</li>
+<li>AWSの仕様ドキュメントに不明瞭な箇所がある
+
+<ul>
+<li>POSTの処理について記述が矛盾</li>
+</ul>
+</li>
+<li>cfn-push-statsはPOST処理を使用。そのため問題がおきてる。</li>
+</ul>
+
+<p>keystone-client内のEC2互換コードがAWSの実装からずれているようなので、これを修正するのが良さそうです。</p>
+
+<h3>
+<a id="パッチ作成パッチ投稿" class="anchor" href="#%E3%83%91%E3%83%83%E3%83%81%E4%BD%9C%E6%88%90%E3%83%91%E3%83%83%E3%83%81%E6%8A%95%E7%A8%BF" aria-hidden="true"><span class="octicon octicon-link"></span></a>パッチ作成＆パッチ投稿</h3>
+
+<p>修正箇所も少なく参考にできる実装もあるので、パッチ作成は簡単です。
+keystone-clientの該当部分のコードの前後と合わせ、下のようなコードになりました。</p>
+
+<pre><code>diff --git a/keystoneclient/contrib/ec2/utils.py b/keystoneclient/contrib/ec2/utils.py
+index 3b722f2..899b95a 100644
+--- a/keystoneclient/contrib/ec2/utils.py
++++ b/keystoneclient/contrib/ec2/utils.py
+@@ -232,12 +232,19 @@ class Ec2Signer(object):
+                 header_list.append('%s:%s' % (h, headers_lower[h]))
+             return '\n'.join(header_list) + '\n'
+
++        def canonical_query_str(verb, params):
++            # POST requests pass parameters in through the request body
++            canonical_qs = ''
++            if verb.upper() != 'POST':
++                canonical_qs = self._canonical_qs(params)
++            return canonical_qs
++
+         # Create canonical request:
+         # http://docs.aws.amazon.com/general/latest/gr/
+         # sigv4-create-canonical-request.html
+         # Get parameters and headers in expected string format
+         cr = "\n".join((verb.upper(), path,
+-                        self._canonical_qs(params),
++                        canonical_query_str(verb, params),
+                         canonical_header_str(),
+                         auth_param('SignedHeaders'),
+                         body_hash))
+</code></pre>
+
+<p>動作確認したところ、確かに動きます。やった、とりあえず解決！</p>
+
+<p>openstack-devのメーリングリストに報告します。（普通は問題解析する前に調査・報告するほうが良いと思います。誰かもうやっている可能性があるので。）
+HeatとKeystoneまたがっていて両方に報告する必要がありそうです。そのときのメールは下のような感じでした。</p>
+
+<p><a href="http://lists.openstack.org/pipermail/openstack-dev/2014-August/043900.html">[openstack-dev] [Heat] [Keystone] Heat cfn-push-stats failed with '403 SignatureDoesNotMatch', it may be Keystone problem.</a></p>
+
+<p>その後launchpadに起票して、Gerritにパッチ投稿します。</p>
+
+<ul>
+<li><a href="https://bugs.launchpad.net/python-keystoneclient/+bug/1360892">Bug #1360892 “EC2 v4 signature calculation is wrong, in case of ...”</a></li>
+<li><a href="https://review.openstack.org/#/c/116523/">Change Iad4e3921: fix EC2 Signature Version 4 calculation, in the case of POST</a></li>
+</ul>
+
+<p>ちなみに自分はCentOS + RDOというあまり開発向けでない環境で動かしているため、masterとの差分が存在する可能性があります。
+今回パッチ部分についてgit logなどで更新がないか確認してからGerritに投稿しました。</p>
+
+<p>また上記のパッチだけだとパッチ適用有無に限らずユニットテストを通ってしまいます。
+なので、パッチ適用していない場合にユニットテストを通らなくなるテストコードも追加し、今後デグレが発生しないようにしておきました。</p>
+
+<p>投稿してCIを通過したのを確認してからIRQでレビュー依頼をしてみます。
+が、feature freezeも近づいておりレビュアーの方が忙しいのか、なかなかレビューが進みません。
+2週間くらい反応がなく、再度IRQでレビュー依頼をしたところ、Morgan Fainbergさんが対応してくれました。
+が、どうも今回の部分はあまり詳しくなくて自分では判断できないとのこと。
+そこを見ている人に連絡してくれるということだったので、しょうがなくまた置いておくことになりました。
+VM HAってわりと興味がある人がいると思うので、動かないままJunoがリリースされてしまうのは嫌だなー、と思い見ていると、feature freeze直前で+2レビューされて、なんとか無事マージされたようです。</p>
+
+<h3>
+<a id="環境" class="anchor" href="#%E7%92%B0%E5%A2%83" aria-hidden="true"><span class="octicon octicon-link"></span></a>環境</h3>
+
+<p>もし上の現象を実際に試してみたいという方がいれば（いないでしょうけど）、Icehouseリリースで試してみてください。
+自分の環境はCentOS 6 + RDOで、パッケージのバージョンは下記で試しています。</p>
+
+<ul>
+<li>
+<p>クライアント側</p>
+
+<ul>
+<li>cloud-init-0.7.4-2.el6.noarch</li>
+<li>heat-cfntools-1.2.6-2.el6.noarch</li>
+<li>python-boto-2.27.0-1.el6.noarch</li>
+</ul>
+</li>
+<li>
+<p>サーバ側</p>
+
+<ul>
+<li>python-keystoneclient-0.9.0-1.el6.noarch</li>
+<li>python-keystone-2014.1.1-1.el6.noarch</li>
+<li>openstack-keystone-2014.1.1-1.el6.noarch</li>
+</ul>
+</li>
+</ul>
+
+<h3>
+<a id="おわりに" class="anchor" href="#%E3%81%8A%E3%82%8F%E3%82%8A%E3%81%AB" aria-hidden="true"><span class="octicon octicon-link"></span></a>おわりに</h3>
+
+<p>冒頭Heatの話と言っておきながら、終着点はkeystone-clientでした。
+Junoの開発後半でマージされているので、Junoでは問題なくVM HAは動作しているはずです。</p>
+
+<p>今年の自分の印象に残った作業はこんな感じです。
+来年は、もっと多くのパッチを書いたり新機能の確認など行えたら良いなと思っています。
+特にTokyo Summitもありますしね。どんどん盛り上がっていきたいです。</p>
+
+<h3>
+<a id="免責" class="anchor" href="#%E5%85%8D%E8%B2%AC" aria-hidden="true"><span class="octicon octicon-link"></span></a>免責</h3>
+
+<p>上記記事の内容は過去の作業を思い出しながら書いているので、部分的に間違った内容を含んでいる可能性があります。ご了承ください。</p>
+      </section>
+    </div>
+
+    <!-- FOOTER  -->
+    <div id="footer_wrap" class="outer">
+      <footer class="inner">
+        <p>Published with <a href="http://pages.github.com">GitHub Pages</a></p>
+      </footer>
+    </div>
+
+    
+
+  </body>
+</html>
